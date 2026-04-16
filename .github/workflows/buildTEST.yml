@@ -1,0 +1,154 @@
+name: Build and Release
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    inputs:
+      create_nightly:
+        description: 'Create nightly release'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: macos-26-intel
+    outputs:
+      artifact: ${{ steps.upload-artifact.outputs.artifact }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Cache Firefox submodule
+        id: cache-firefox-submodule
+        uses: actions/cache@v4
+        with:
+          path: ./engine/firefox
+          key: firefox-submodule-${{ hashFiles('.gitmodules') }}-${{ hashFiles('./engine/**') }}
+
+      - name: Checkout Firefox submodule
+        if: steps.cache-firefox-submodule.outputs.cache-hit != 'true'
+        run: git submodule update --init --depth 1 --recursive engine/firefox
+
+      - name: Update Gecko
+        run: ./tools/development/update-gecko.sh
+
+      - name: Get engine revision
+        id: engine-rev
+        run: |
+          ENGINE_REV=$(git -C ./engine/firefox rev-parse HEAD)
+          echo "revision=$ENGINE_REV" >> $GITHUB_OUTPUT
+
+      - name: Apply Gecko patches
+        run: ./tools/development/apply-patches.sh
+
+      - name: Cache Gecko build
+        id: cache-gecko
+        uses: actions/cache@v4
+        with:
+          path: ./engine/firefox/obj-aarch64-apple-ios
+          key: gecko-build-${{ steps.engine-rev.outputs.revision }}-${{ hashFiles('./patches/**') }}
+
+      - name: Setup Python
+        if: steps.cache-gecko.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build Gecko
+        if: steps.cache-gecko.outputs.cache-hit != 'true'
+        run: ./tools/development/build-gecko.sh
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.2'
+
+      - name: Install build certificate
+        env:
+          BUILD_CERTIFICATE: ${{ secrets.BUILD_CERTIFICATE }}
+          BUILD_CERTIFICATE_PWD: ${{ secrets.BUILD_CERTIFICATE_PWD }}
+          KEYCHAIN_PWD: ${{ secrets.KEYCHAIN_PWD }}
+        run: |
+          echo $BUILD_CERTIFICATE | base64 --decode > certificate.p12
+          security create-keychain -p $KEYCHAIN_PWD build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p $KEYCHAIN_PWD build.keychain
+          security import certificate.p12 -k build.keychain -P $BUILD_CERTIFICATE_PWD -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k $KEYCHAIN_PWD build.keychain
+
+      - name: Build the browser app
+        run: |
+          xcodebuild archive \
+            -scheme "Reynard" \
+            -archivePath "./dist/Reynard.xcarchive" \
+            -project "./browser/Reynard.xcodeproj" \
+            -sdk iphoneos \
+            -arch arm64 \
+            -configuration Release \
+            -xcconfig "./browser/Configuration/Reynard.xcconfig"
+
+      - name: Create IPA
+        run: ./tools/release/create-ipa.sh
+
+      - name: Tar build artifact
+        run: tar -czf ./dist/Reynard.xcarchive.tar.gz -C ./dist Reynard.xcarchive
+
+      - name: Upload build artifact
+        id: upload-artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Reynard.xcarchive
+          path: ./dist/Reynard.xcarchive.tar.gz
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Reynard.ipa
+          path: ./dist/Reynard.ipa
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event.schedule || (github.event.inputs.create_nightly && github.event.inputs.create_nightly == 'true')
+    permissions:
+      contents: write
+    steps:
+      - name: Download IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: Reynard.ipa
+          path: ./dist
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Get version and engine info
+        id: version
+        run: |
+          CURRENT_VERSION=$(grep 'CURRENT_VERSION' ./browser/Configuration/Reynard.xcconfig | cut -d '=' -f2 | tr -d ' ')
+          CURRENT_BUILD=$(grep 'CURRENT_BUILD' ./browser/Configuration/Reynard.xcconfig | cut -d '=' -f2 | tr -d ' ')
+          ENGINE_REVISION=$(cat ./engine/firefox/release.txt)
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "current_build=$CURRENT_BUILD" >> $GITHUB_OUTPUT
+          echo "engine_revision=$ENGINE_REVISION" >> $GITHUB_OUTPUT
+
+      - name: Create nightly release
+        uses: andelf/nightly-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          body: |
+            **Build:** ${{ steps.version.outputs.current_build }}
+            **Version:** ${{ steps.version.outputs.current_version }}
+            **Engine:** [${{ steps.version.outputs.engine_revision }}](https://github.com/mozilla-firefox/firefox/commit/${{ steps.version.outputs.engine_revision }})
+            **Commit:** [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
+
+            This is a nightly release [created automatically with GitHub Actions workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}).
+          files: |
+            ./dist/Reynard.ipa
