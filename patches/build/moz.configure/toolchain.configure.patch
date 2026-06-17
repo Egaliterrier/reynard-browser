@@ -1,0 +1,20 @@
+diff --git a/build/moz.configure/toolchain.configure b/build/moz.configure/toolchain.configure
+index 5ca00b2..21875e3 100644
+--- a/build/moz.configure/toolchain.configure
++++ b/build/moz.configure/toolchain.configure
+@@ -1816,7 +1816,14 @@ def select_linker_tmpl(host_or_target):
+                 kind = "ld64"
+ 
+             elif retcode != 0:
+-                return None
++                # Newer Apple linkers reject --version and do not reliably emit
++                # the LD_PRINT_OPTIONS marker on CI. The compiler usability
++                # checks above already verified the Darwin/iOS toolchain, so
++                # keep treating the Apple target linker as ld64.
++                if target.kernel == "Darwin" and linker != "lld":
++                    kind = "ld64"
++                else:
++                    return None
+ 
+             elif "mold" in stdout:
+                 kind = "mold"
