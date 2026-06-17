@@ -1,0 +1,96 @@
+name: Build Reynard
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    name: Build iOS artifacts
+    runs-on: macos-26
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest
+
+      - name: Check Apple SDK
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhoneOS SDK version: $SDK_VERSION"
+          SDK_MAJOR="${SDK_VERSION%%.*}"
+          SDK_MINOR="${SDK_VERSION#*.}"
+          SDK_MINOR="${SDK_MINOR%%.*}"
+          if [ "$SDK_MAJOR" -lt 26 ] || { [ "$SDK_MAJOR" -eq 26 ] && [ "$SDK_MINOR" -lt 4 ]; }; then
+            echo "iPhoneOS SDK $SDK_VERSION is too old; Firefox requires at least 26.4."
+            exit 1
+          fi
+
+      - name: Install release dependencies
+        run: |
+          brew update
+          brew install ldid
+          rustup target add aarch64-apple-ios
+          cargo install cbindgen --version 0.29.2 --locked
+
+      - name: Cache Rust and Gecko outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            support/idevice/target
+            engine/firefox/obj-aarch64-apple-ios
+          key: ${{ runner.os }}-build-${{ hashFiles('engine/release.txt', 'patches/**/*.patch', 'support/idevice/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-build-
+
+      - name: Fetch Firefox source
+        run: zsh tools/development/update-gecko.sh
+
+      - name: Apply Gecko patches
+        run: zsh tools/development/apply-patches.sh
+
+      - name: Build idevice support library
+        run: zsh tools/development/build-idevice.sh
+
+      - name: Build Gecko
+        run: sh tools/development/build-gecko.sh
+
+      - name: Archive Reynard
+        run: sh tools/release/build-app.sh
+
+      - name: Create installable packages
+        run: sh tools/release/create-ipa.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Reynard-${{ github.sha }}
+          path: |
+            dist/Reynard.ipa
+            dist/Reynard-TrollStore.tipa
+            dist/Reynard-Jailbroken.ipa
+          if-no-files-found: error
+          retention-days: 14
